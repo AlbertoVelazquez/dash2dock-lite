@@ -1,0 +1,678 @@
+diff --git a/animator.js b/animator.js
+index dcc8426..59e2207 100644
+--- a/animator.js
++++ b/animator.js
+@@ -8,9 +8,9 @@ import Gio from 'gi://Gio';
+ const Point = Graphene.Point;
+ 
+ import { Dot } from './apps/dot.js';
+ import { DockPosition } from './dock.js';
+-import { Vector } from './vector.js';
++
+ 
+ import { DockItemDotsOverlay, DockItemBadgeOverlay } from './dockItems.js';
+ import {
+   Bounce,
+@@ -111,12 +111,20 @@ export let Animator = class {
+     }
+ 
+     let simulation = false;
+ 
+-    if (!dock.layout()) {
++    const layoutChanged = dock._needsLayout;
++    if (dock._needsLayout && !dock.layout()) {
+       console.log('unable to layout()');
+       return;
+     }
++    if (layoutChanged) this._idleFrames = 0;
++
++    // If icons not ready yet (GNOME 50 lazy init), schedule a retry next frame
++    if (!dock._icons || !dock._icons.length) {
++      dock._needsLayout = true;
++      return;
++    }
+ 
+     if (!this._precreateResources(dock)) {
+       return;
+     }
+@@ -175,8 +183,20 @@ export let Animator = class {
+     let animateIcons = dock._icons;
+     let iconSize = dock._iconSizeScaledDown;
+     let scaleFactor = dock._scaleFactor;
+ 
++    // Idle optimization: skip expensive per-icon work once icons have settled.
++    // Use a frame counter so icons get ~675ms (45 frames × 15ms) to lerp back
++    // to resting positions before we stop rendering.
++    if (isWithin || dock._dragging) {
++      this._idleFrames = 0;
++    } else {
++      this._idleFrames = (this._idleFrames || 0) + 1;
++    }
++    if (!isWithin && !didFadeIn && !dock._dragging && this._idleFrames > 45) {
++      return;
++    }
++
+     let nearestIdx = -1;
+     let nearestIcon = null;
+     let nearestDistance = -1;
+ 
+@@ -194,15 +214,15 @@ export let Animator = class {
+         icon._handled = true;
+         dock._maybeBounce(icon, true);
+       }
+ 
+-      icon._pos = [...pos];
+-      icon._fixedPosition = [...pos];
++      icon._posX = pos[0];
++      icon._posY = pos[1];
++      icon._fixedX = pos[0];
++      icon._fixedY = pos[1];
+ 
+       // get nearest
+-      let bposcenter = [...pos];
+-      bposcenter[0] += iconCenterOffset;
+-      bposcenter[1] += iconCenterOffset;
++      let bposcenter = [pos[0] + iconCenterOffset, pos[1] + iconCenterOffset];
+       let dst = get_distance_sqr(pointer, bposcenter);
+ 
+       if (
+         isWithin &&
+@@ -268,9 +288,13 @@ export let Animator = class {
+ 
+     // animate
+     let firstIcon = null;
+     let lastIcon = null;
+-    let iconTable = [];
++
++    // Reuse iconTable to reduce per-frame allocation (aggressive cleanup)
++    if (!this._iconTable) this._iconTable = [];
++    let iconTable = this._iconTable;
++    iconTable.length = 0;   // clear without allocating new array
+ 
+     let scaleAtMin = 1;
+     let scaleAtMax = 1;
+     if (magnify != 0) {
+@@ -281,19 +305,24 @@ export let Animator = class {
+     if (dock.extension.animation_rise_curve == 1) {
+       Ease = CubicEaseOut;
+     }
+ 
++    // Aggressive gating inside active path: only do the expensive magnify/rise/spread math
++    // when there is actual interaction (pointer close enough to cause visible scale).
++    const shouldDoMagnifyMath = nearestIcon || didScale;
++
+     animateIcons.forEach((icon) => {
+       if (!icon._icon) return;
+-      let original_pos = [...icon._pos];
+ 
+-      // used by background resizing and repositioning
+-      icon._fixedPosition = [...original_pos];
++      let ix = icon._posX;
++      let iy = icon._posY;
++      icon._fixedX = ix;
++      icon._fixedY = iy;
+ 
+-      original_pos[0] += icon.width / 2;
+-      original_pos[1] += icon.height / 2;
++      // center for calculations
++      let cx = ix + icon.width / 2;
++      let cy = iy + icon.height / 2;
+ 
+-      icon._pos = [...original_pos];
+       icon._translate = 0;
+       icon._translateRise = 0;
+ 
+       iconTable.push(icon);
+@@ -302,16 +331,16 @@ export let Animator = class {
+       }
+       lastIcon = null;
+ 
+       let scale = 1;
+-      let dx = icon._fixedPosition[0] + iconCenterOffset - px;
++      let dx = ix + iconCenterOffset - px;
+       if (vertical) {
+-        dx = original_pos[1] - py;
++        dx = cy - py;
+       }
+ 
+       //! _p replace with a more descriptive variable name
+       icon._p = 0;
+-      if (dx * dx < threshold * threshold && nearestIcon) {
++      if (shouldDoMagnifyMath && dx * dx < threshold * threshold && nearestIcon) {
+         let adx = Math.abs(dx);
+         let p = 1.0 - adx / threshold;
+         // let fp = p * 0.6 * (1 + magnify);
+         icon._p = p;
+@@ -352,9 +381,10 @@ export let Animator = class {
+       } else {
+         icon._icon.set_scale(scale, scale);
+       }
+ 
+-      if (!icon._pos) {
++      // Guard removed (aggressive cleanup) — first loop always sets _posX/_posY when we have _icon
++      if (icon._posX === undefined) {
+         return;
+       }
+     });
+ 
+@@ -760,113 +790,118 @@ export let Animator = class {
+         renderer.opacity =
+           icon._icon == dock._dragged && dock._dragging ? 75 : 255;
+       }
+ 
+-      //! make more readable
+-      let flags = {
+-        bottom: {
+-          x: 0.5,
+-          y: 1,
+-          lx: 0,
+-          ly: 0.5 * icon._targetScale * scaleFactor,
+-        },
+-        top: {
+-          x: 0.5,
+-          y: 0,
+-          lx: 0,
+-          ly: -1.5 * icon._targetScale * scaleFactor,
+-        },
+-        left: {
+-          x: 0,
+-          y: 0.5,
+-          lx: -1.25 * icon._targetScale * scaleFactor,
+-          ly: -1.25,
+-        },
+-        right: {
+-          x: 1,
+-          y: 0.5,
+-          lx: 1.5 * icon._targetScale * scaleFactor,
+-          ly: -1.25,
+-        },
+-      };
+-
++      // Hoisted outside per-icon loop (aggressive allocation reduction)
++      // Was created N times per frame for N icons.
++      if (!this._cachedFlags || this._cachedFlagsScale !== scaleFactor || this._cachedFlagsPos !== dock._position) {
++        this._cachedFlags = {
++          bottom: {
++            x: 0.5,
++            y: 1,
++            lx: 0,
++            ly: 0.5 * scaleFactor, // will be multiplied by targetScale per icon below if needed
++          },
++          top: {
++            x: 0.5,
++            y: 0,
++            lx: 0,
++            ly: -1.5 * scaleFactor,
++          },
++          left: {
++            x: 0,
++            y: 0.5,
++            lx: -1.25 * scaleFactor,
++            ly: -1.25,
++          },
++          right: {
++            x: 1,
++            y: 0.5,
++            lx: 1.5 * scaleFactor,
++            ly: -1.25,
++          },
++        };
++        this._cachedFlagsScale = scaleFactor;
++        this._cachedFlagsPos = dock._position;
++      }
++      const flags = this._cachedFlags;
+       let posFlags = flags[dock._position];
+ 
+-      // badges
+-      //! ***badge location at scaling is messed up***
+-      let badge = this._badges[icon._idx];
+-      badge.hide();
+-      if (icon != dock._dragged) {
+-        let appNotices = icon._appwell
+-          ? dock.extension.services._appNotices[icon._appwell.app.get_id()]
+-          : null;
+-        let noticesCount = 0;
+-        if (appNotices) {
+-          noticesCount = appNotices.count;
++      // Aggressive gating: only do badge/dot/service work when something visually changed
++      // (big allocation + CPU win when the dock is static)
++      const didVisualChange = didScale || dock._dragging || icon._targetScale > 1.01;
++
++      if (didVisualChange) {
++        // badges
++        let badge = this._badges[icon._idx];
++        badge.hide();
++        if (icon != dock._dragged) {
++          let appNotices = icon._appwell
++            ? dock.extension.services._appNotices[icon._appwell.app.get_id()]
++            : null;
++          let noticesCount = 0;
++          if (appNotices) {
++            noticesCount = appNotices.count;
++          }
++          let target = dock.renderArea;
++          if (badge && noticesCount > 0) {
++            badge.update(icon, {
++              noticesCount,
++              position: dock._position,
++              vertical,
++              extension: dock.extension,
++            });
++
++            badge.width = icon._renderer.width * icon._renderer.scaleX;
++            badge.height = badge.width;
++            badge.x = icon._renderer.x;
++            badge.y = icon._renderer.y;
++
++            badge.set_scale(icon._scale, icon._scale);
++            badge.show();
++          }
+         }
+-        // noticesCount = 1;
+-        let target = dock.renderArea;
+-        if (badge && noticesCount > 0) {
+-          badge.update(icon, {
+-            noticesCount,
+-            position: dock._position,
+-            vertical,
+-            extension: dock.extension,
+-          });
+-          // badge.x = icon._renderer.x + 3 * icon._scale;
+-          // badge.y = icon._renderer.y - 3 * icon._scale;
+-
+-          // if (dock._position == DockPosition.TOP) {
+-          //   badge.y = icon._renderer.y + (icon.height - 6) * icon._scale;
+-          // }
+-
+-          badge.width = icon._renderer.width * icon._renderer.scaleX;
+-          badge.height = badge.width;
+-          badge.x = icon._renderer.x;
+-          badge.y = icon._renderer.y;
+ 
+-          badge.set_scale(icon._scale, icon._scale);
+-          badge.show();
++        // dots
++        let dots = this._dots[icon._idx];
++        dots.hide();
++        if (
++          icon != dock._dragged &&
++          icon._appwell &&
++          icon._appwell.app &&
++          icon._appwell.app.get_n_windows
++        ) {
++          let appCount = dock.getAppWindowsFiltered(icon._appwell.app).length;
++          if (dots && appCount > 0) {
++            dots.update(icon, {
++              appCount,
++              position: dock._position,
++              vertical,
++              extension: dock.extension,
++              dock,
++            });
++
++            dots.width = icon._renderer.width * icon._renderer.scaleX;
++            dots.height = dots.width;
++            dots.x = icon._renderer.x;
++            dots.y = icon._renderer.y;
++            dots.set_scale(icon._scale, icon._scale);
++            dots.show();
++          }
+         }
+-      }
+ 
+-      // dots
+-      //! ***dot requires a little more aligning at dock position other than bottom***
+-      let dots = this._dots[icon._idx];
+-      dots.hide();
+-      if (
+-        icon != dock._dragged &&
+-        icon._appwell &&
+-        icon._appwell.app &&
+-        icon._appwell.app.get_n_windows
+-      ) {
+-        let appCount = dock.getAppWindowsFiltered(icon._appwell.app).length;
+-        // appCount = 1;
+-        if (dots && appCount > 0) {
+-          dots.update(icon, {
+-            appCount,
+-            position: dock._position,
+-            vertical,
+-            extension: dock.extension,
++        // custom icons (clock/calendar/trash etc)
++        if (dock.extension.services) {
++          dock.extension.services.updateIcon(icon, {
++            scaleFactor,
++            iconSize,
+             dock,
+           });
+-
+-          dots.width = icon._renderer.width * icon._renderer.scaleX;
+-          dots.height = dots.width;
+-          dots.x = icon._renderer.x;
+-          dots.y = icon._renderer.y;
+-          dots.set_scale(icon._scale, icon._scale);
+-          dots.show();
+         }
+-      }
+-
+-      // custom icons
+-      if (dock.extension.services) {
+-        dock.extension.services.updateIcon(icon, {
+-          scaleFactor,
+-          iconSize,
+-          dock,
+-        });
++      } else {
++        // keep overlays hidden when nothing is changing
++        this._badges[icon._idx]?.hide();
++        this._dots[icon._idx]?.hide();
+       }
+     });
+ 
+     // separators
+@@ -952,17 +987,16 @@ export let Animator = class {
+       let speed =
+         ((150 + 300 * dock.extension.autohide_speed * scaleFactor) / 1000) *
+         autohide_slowDown;
+ 
+-      let v1 = new Vector([targetX, targetY, 0]);
+-      let v2 = new Vector([dock.dash.translationX, dock.dash.translationY, 0]);
+-      let dst = v1.subtract(v2);
+-      let mag = dst.magnitude();
++      // Inline 2D vector math (removed dependency on vector.js)
++      const dx = targetX - dock.dash.translationX;
++      const dy = targetY - dock.dash.translationY;
++      const mag = Math.sqrt(dx * dx + dy * dy);
+       if (mag > 0) {
+-        // let ndst = dst.normalize();
+-        let v3 = v2.add(dst.multiplyScalar(speed));
+-        translationX = v3.x;
+-        translationY = v3.y;
++        const factor = speed / mag;
++        translationX = dock.dash.translationX + dx * factor;
++        translationY = dock.dash.translationY + dy * factor;
+       }
+ 
+       dock.dash.translationX = translationX;
+       dock.dash.translationY = translationY;
+@@ -1048,132 +1082,14 @@ export let Animator = class {
+       dock._debounceEndAnimation();
+     }
+ 
+     dock.extension.integrations.bms_update_size(this);
++    if (dock.renderArea.opacity < 255) dock.renderArea.opacity = 255;
+   }
+ 
++  // bounceIcon removed (bounce feature is optional per user request)
++  // Aggressive cleanup: eliminated ~120 lines of complex frame-generation code
++  // and dependency on the removed runAnimation timer method.
+   bounceIcon(appwell) {
+-    let dock = this.dock;
+-    let app_id = appwell._id;
+-
+-    // let scaleFactor = dock.getMonitor().geometry_scale;
+-    //! why not scaleFactor?
+-    let travel =
+-      (dock._iconSize / 3) *
+-      ((0.25 + dock.extension.animation_bounce_height) * 1.5);
+-    // * scaleFactor;
+-    appwell.translation_y = 0;
+-
+-    const getTarget = (app_id) => {
+-      if (dock._dragging) return [null, null];
+-      let icons = dock._findIcons();
+-      let icon = icons.find((icon) => {
+-        return icon._appwell && icon._appwell._id == app_id;
+-      });
+-      if (!icon || !icon._appwell) {
+-        return [null, null];
+-      }
+-      return [icon._appwell.get_parent(), icon._appwell];
+-    };
+-
+-    const translateDecor = (container, appwell) => {
+-      if (!container._icon) return;
+-      if (container._renderer) {
+-        container._renderer.translationY = appwell.translationY;
+-      }
+-      if (container._image) {
+-        container._image.translationY = appwell.translationY;
+-      }
+-      if (container._badge) {
+-        container._badge.translationY = appwell.translationY;
+-      }
+-      if (container._label) {
+-        container._label.opacity = 0;
+-      }
+-    };
+-
+-    let t = 250;
+-    let _frames = [
+-      {
+-        _duration: t,
+-        _func: (f, s) => {
+-          let res = Linear.easeNone(f._time, 0, travel, f._duration);
+-          let [container, appwell] = getTarget(app_id);
+-          if (!appwell) return;
+-          appwell._bounce = true;
+-          if (dock.isVertical()) {
+-            appwell.translation_x =
+-              dock._position == DockPosition.LEFT ? res : -res;
+-            if (container._renderer) {
+-              container._renderer.translationX = appwell.translationX;
+-            }
+-          } else {
+-            appwell.translation_y =
+-              dock._position == DockPosition.BOTTOM ? -res : res;
+-            if (container._renderer) {
+-              container._renderer.translationY = appwell.translationY;
+-            }
+-          }
+-          translateDecor(container, appwell);
+-        },
+-      },
+-      {
+-        _duration: t * 3,
+-        _func: (f, s) => {
+-          let res = Bounce.easeOut(f._time, travel, -travel, f._duration);
+-          let [container, appwell] = getTarget(app_id);
+-          if (!appwell) return;
+-          appwell._bounce = true;
+-          if (dock.isVertical()) {
+-            appwell.translation_x = appwell.translation_x =
+-              dock._position == DockPosition.LEFT ? res : -res;
+-            if (container._renderer) {
+-              container._renderer.translationX = appwell.translationX;
+-            }
+-          } else {
+-            appwell.translation_y =
+-              dock._position == DockPosition.BOTTOM ? -res : res;
+-            if (container._renderer) {
+-              container._renderer.translationY = appwell.translationY;
+-            }
+-          }
+-          translateDecor(container, appwell);
+-        },
+-      },
+-    ];
+-
+-    let frames = [];
+-    for (
+-      let i = 0;
+-      i < [3, 1, 2, 3][dock.extension.animation_bounce_frequency || 0];
+-      i++
+-    ) {
+-      _frames.forEach((b) => {
+-        frames.push({
+-          ...b,
+-        });
+-      });
+-    }
+-
+-    dock.extension._hiTimer.runAnimation([
+-      ...frames,
+-      {
+-        _duration: 10,
+-        _func: (f, s) => {
+-          let [container, appwell] = getTarget(app_id);
+-          if (!appwell) return;
+-          appwell._bounce = true;
+-          appwell.translation_y = 0;
+-          translateDecor(container, appwell);
+-        },
+-      },
+-      {
+-        _duration: 10,
+-        _func: (f, s) => {
+-          let [container, appwell] = getTarget(app_id);
+-          if (!appwell) return;
+-          appwell._bounce = false;
+-        },
+-      },
+-    ]);
++    // no-op (bounce is optional)
+   }
+ };
+diff --git a/autohide.js b/autohide.js
+index d47d6a7..a9a4cd6 100644
+--- a/autohide.js
++++ b/autohide.js
+@@ -277,19 +277,15 @@ export let AutoHide = class {
+   }
+ 
+   _debounceCheckHide() {
+     if (this.extension._loTimer) {
+-      if (!this._debounceCheckSeq) {
+-        this._debounceCheckSeq = this.extension._loTimer.runDebounced(
+-          () => {
+-            this._checkHide();
+-          },
+-          DEBOUNCE_HIDE_TIMEOUT,
+-          'debounceCheckHide'
+-        );
+-      } else {
+-        this.extension._loTimer.runDebounced(this._debounceCheckSeq);
+-      }
++      this.extension._loTimer.runDebounced(
++        () => {
++          this._checkHide();
++        },
++        DEBOUNCE_HIDE_TIMEOUT,
++        'debounceCheckHide'
++      );
+     }
+   }
+ 
+   _checkHide() {
+diff --git a/CLAUDE.md b/CLAUDE.md
+new file mode 100644
+index 0000000..a41a97b
+--- /dev/null
++++ b/CLAUDE.md
+@@ -0,0 +1,106 @@
++# CLAUDE.md
++
++This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
++
++## Project Overview
++
++Dash2Dock Lite is a GNOME Shell extension (UUID: `dash2dock-lite@icedman.github.com`) that replaces the default GNOME Dash with an animated dock. It targets GNOME 42+ with primary support for GNOME 45+, and has initial support for GNOME 50.
++
++## Common Commands
++
++```bash
++make              # build schemas + install to ~/.local/share/gnome-shell/extensions/
++make build        # compile GLib schemas only
++make install      # remove old install, build, and copy extension files
++make lint         # run eslint
++make test-prefs   # open extension preferences UI
++make test-shell   # run GNOME Shell in nested mode (for live testing)
++make test-shell2  # nested GNOME Shell with 2× slowdown (animation debugging)
++make publish      # create distributable zip archive
++make pretty       # format JS with prettier + prettify XML UI files
++make xml-lint     # validate .ui files with xmllint
++```
++
++After editing source files, `make install` followed by restarting the nested shell (or reloading the extension) is the typical dev loop.
++
++## Architecture
++
++### Entry Points
++
++- **`extension.js`** — `Dash2DockLiteExt extends Extension`. Manages the dock array, GNOME Shell listeners, multi-monitor setup, and service lifecycle. Owns the three shared timers.
++- **`prefs.js`** — `Preferences extends ExtensionPreferences`. GTK4/Adwaita preferences UI backed by GSettings.
++
++### Core Modules
++
++| File | Role |
++|------|------|
++| `dock.js` | `DashToDock extends St.Widget` — main dock widget, positioning, layout, window tracking. The largest and most complex module. |
++| `animator.js` | Icon animation engine — bounce/scale/raise effects, canvas-based dot and badge overlays, easing integration. |
++| `autohide.js` | Intellihide logic — monitors window geometry and shows/hides the dock as windows approach. |
++| `services.js` | Background subscriptions — trash, clock/calendar, notifications, mounts, MPRIS. Uses a `ServiceCounter` ticking pattern. |
++| `dockItems.js` | Dock icon/item classes: `DockIcon`, `DockItemContainer`, `DockBackground`. |
++| `dockItemMenu.js` | Context menu and the fan-out `DockItemList` animation (Downloads icon). |
++| `timer.js` | Subscriber-based timer with `runLoop`/`runOnce`/`runDebounced` patterns. |
++| `monitors.js` | Multi-monitor config and tracking. |
++| `integrations.js` | Compatibility hooks for Compiz Magic Lamp and Blur My Shell. |
++| `style.js` | Theme/style management. |
++| `effects/` | Clutter GLSL shader effects (tint, monochrome, blur, color) plus `easing.js`. |
++| `apps/` | Dock widgets — clock, calendar, indicator dots, recents, overlays. |
++| `ui/` | GTK `.ui` XML files for the preferences dialog. |
++| `preferences/keys.js` | Single source of truth for all GSettings keys. |
++
++### Timer System (critical to understand)
++
++Three shared `Timer` instances live on the extension object:
++
++| Timer | Resolution | Purpose |
++|-------|-----------|---------|
++| `_hiTimer` | 15ms (adjustable) | Animation loop — drives `animate(dt)` on each dock |
++| `_loTimer` | 750ms | Debounced/deferred work — end-animation debounce, autohide checks |
++| `_timer` | 3500ms | Long-running service polling |
++
++`Timer.subscribe(obj)` deduplicates by name:
++- **`loop`-type** subscribers: on re-subscription, `_time` is **not** reset (to avoid starving the loop when callers fire faster than the interval — e.g. `_onMotionEvent`).
++- **`debounce`/`once`-type** subscribers: on re-subscription, `_time` is reset to 0 (extends the delay from the latest trigger).
++
++`_beginAnimation()` in `dock.js` calls `_hiTimer.runLoop(..., 'animationTimer')`. Rapid GNOME events (`_onMotionEvent`, `_onRestacked`) can call `_beginAnimation()` many times per second — the name-dedup ensures only one loop subscriber ever exists and the timer is never starved.
++
++`_debounceEndAnimation()` uses `_loTimer.runDebounced(..., 'debounceEndAnimation')` (delay ≈ 765ms). As long as `didScale` is true in `animate()`, the debounce is reset every frame and `_endAnimation()` never fires. When the cursor leaves the interaction zone and animation settles (~45 idle frames at 15ms = 675ms), `_endAnimation()` eventually cancels the hi-res timer.
++
++### Rendering Architecture
++
++Icons in `dock.dash` (the real GNOME Dash) are hidden (`c._icon.opacity = 0`). A parallel `dock.renderArea` (offscreen `St.Widget`, opacity 0→255 on first frame) holds cloned `St.Icon` renderers, dot overlays, and badge overlays created by `Animator._precreateResources()`. The animator drives scale/position/visibility on the renderArea icons every frame.
++
++### Layout vs Animation
++
++- `layout()` / `_findIcons()` runs only when `_needsLayout = true`. It traverses the Dash widget tree to populate `dock._icons[]`. Set `_needsLayout = true` whenever the icon list may have changed (icon added/removed, drag events, mount events, etc.).
++- `animate(dt)` runs every hi-res timer tick. It calls `layout()` only if needed, skips per-icon work when `_idleFrames > 45` (cursor not near dock), and returns `renderArea.opacity = 255` at end.
++
++### GNOME Version Compatibility
++
++GNOME 50 changed icon internals. `_getStIconFromAppwell()` in `dock.js` handles the difference:
++- GNOME 46 and earlier: `appwell.icon.icon` → `StIcon`
++- GNOME 50+: `appwell.icon._iconBin.child` → `StIcon` (lazy init — may be null on first call; `_needsLayout = true` retry handles this)
++
++### Known Broken Code
++
++These methods were removed from `Timer` but are still referenced and will crash if called:
++- `extension.js:dumpTimers()` calls `timer.dumpSubscribers()` (removed from `Timer`)
++- `diagnostics.js` calls `timer.runSequence()` (removed from `Timer`)
++
++These are only triggered explicitly (debug/diagnostics), not during normal operation.
++
++### Key Patterns
++
++- **GObject subclassing** — All widgets use `GObject.registerClass`. Signal connections must be disconnected on `destroy`.
++- **Settings** — Persistent config via GSettings (`org.gnome.shell.extensions.dash2dock-lite`). Preference changes trigger live reloads through `_enableSettings()` callbacks.
++- **Canvas rendering** — Window indicator dots and badges are drawn on HTML5-style canvas via `apps/dot.js`.
++- **User config overrides** — `~/.config/d2da/config.json`, `~/.config/d2da/style.css`, and `~/.config/d2da/themes/` for runtime customisation outside GSettings.
++
++## Linting
++
++ESLint config is at `.eslintrc.yml`, extending `lint/eslintrc-gjs.yml` (GJS globals) and `lint/eslintrc-shell.yml` (GNOME Shell globals). Run `make lint` before committing.
++
++## Legacy GNOME Support
++
++`tools/transpile.py` converts the modern codebase for GNOME 42–44. Use `make g44` to produce that build. Do not target the transpiled output when making changes — edit the main source only.

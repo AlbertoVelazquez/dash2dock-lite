@@ -1,0 +1,98 @@
+diff --git a/dock.js b/dock.js
+index b6b82ae..62160cf 100644
+--- a/dock.js
++++ b/dock.js
+@@ -5,8 +5,9 @@ import * as Fav from 'resource:///org/gnome/shell/ui/appFavorites.js';
+ import * as Config from 'resource:///org/gnome/shell/misc/config.js';
+ 
+ import Shell from 'gi://Shell';
+ import GObject from 'gi://GObject';
++import GLib from 'gi://GLib';
+ import Gio from 'gi://Gio';
+ import Clutter from 'gi://Clutter';
+ import Graphene from 'gi://Graphene';
+ import St from 'gi://St';
+@@ -1263,29 +1264,34 @@ export let Dock = GObject.registerClass(
+       }
+ 
+       this._favorite_ids = Fav.getAppFavorites()._getIds();
+ 
+-      // if (caller) {
+-      //   console.log(`animation triggered by ${caller}`);
+-      // }
+-      if (this.extension._hiTimer && this.debounceEndSeq) {
++      if (this.debounceEndSeq) {
+         this.extension._loTimer.runDebounced(this.debounceEndSeq);
+-        // this.extension._loTimer.cancel(this.debounceEndSeq);
+       }
+ 
+       this.animationInterval = this.extension.animationInterval;
+-      if (this.extension._hiTimer) {
+-        if (!this._animationSeq) {
+-          this._animationSeq = this.extension._hiTimer.runLoop(
+-            (s) => {
+-              this.animate(s._delay);
+-            },
+-            this.animationInterval,
+-            'animationTimer'
+-          );
+-        } else {
+-          this.extension._hiTimer.runLoop(this._animationSeq);
+-        }
++
++      if (!this._animTimeline) {
++        this._lastFrameUs = 0;
++        this._animTimeline = new Clutter.Timeline({
++          actor: global.stage,
++          duration: 60000,
++          repeat_count: -1,
++        });
++        this._animTimeline.connect('new-frame', () => {
++          const now = GLib.get_monotonic_time();
++          const dt = this._lastFrameUs > 0
++            ? Math.min((now - this._lastFrameUs) / 1000, 100)
++            : this.animationInterval;
++          this._lastFrameUs = now;
++          this.animate(dt);
++        });
++      }
++
++      if (!this._animTimeline.is_playing()) {
++        this._lastFrameUs = 0;
++        this._animTimeline.start();
+       }
+     }
+ 
+     _endAnimation() {
+@@ -1296,12 +1302,12 @@ export let Dock = GObject.registerClass(
+       }
+ 
+       this._updateFocusedIcon();
+ 
+-      if (this.extension._hiTimer) {
+-        this.extension._hiTimer.cancel(this._animationSeq);
+-        this.extension._loTimer.cancel(this.debounceEndSeq);
++      if (this._animTimeline) {
++        this._animTimeline.stop();
+       }
++      this.extension._loTimer.cancel(this.debounceEndSeq);
+       this.autohider._debounceCheckHide();
+       this._icons = null;
+       this._dragged = null;
+       this._lastHoveredIcon = null;
+@@ -1330,11 +1336,12 @@ export let Dock = GObject.registerClass(
+       }
+     }
+ 
+     cancelAnimations() {
+-      this.extension._hiTimer.cancel(this._animationSeq);
+-      this._animationSeq = null;
+-      this.extension._hiTimer.cancel(this.autohider._animationSeq);
++      if (this._animTimeline) {
++        this._animTimeline.stop();
++        this._animTimeline = null;
++      }
+       this.autohider._animationSeq = null;
+     }
+ 
+     _updateFocusedIcon() {

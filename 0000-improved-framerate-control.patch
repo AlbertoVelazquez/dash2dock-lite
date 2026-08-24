@@ -1,0 +1,111 @@
+From 879bb4ff85deac3aad4fbc34556c24aadb6d858e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Alberto=20Vel=C3=A1zquez?= <alberto3d.1984@gmail.com>
+Date: Tue, 26 May 2026 23:01:08 +0200
+Subject: [PATCH] improved framerate control
+
+---
+ dock.js      | 21 +++++++++++++++++----
+ extension.js |  8 +++++---
+ ui/tweaks.ui | 14 +++++++-------
+ 3 files changed, 29 insertions(+), 14 deletions(-)
+
+diff --git a/dock.js b/dock.js
+index 62160cf..2f4d370 100644
+--- a/dock.js
++++ b/dock.js
+@@ -1273,6 +1273,7 @@ export let Dock = GObject.registerClass(
+ 
+       if (!this._animTimeline) {
+         this._lastFrameUs = 0;
++        this._frameAccum = 0;
+         this._animTimeline = new Clutter.Timeline({
+           actor: global.stage,
+           duration: 60000,
+@@ -1280,16 +1281,28 @@ export let Dock = GObject.registerClass(
+         });
+         this._animTimeline.connect('new-frame', () => {
+           const now = GLib.get_monotonic_time();
+-          const dt = this._lastFrameUs > 0
+-            ? Math.min((now - this._lastFrameUs) / 1000, 100)
+-            : this.animationInterval;
++          const elapsed = this._lastFrameUs > 0
++            ? (now - this._lastFrameUs) / 1000
++            : 16;
+           this._lastFrameUs = now;
+-          this.animate(dt);
++          const interval = this.animationInterval;
++          if (interval <= 0) {
++            // Adaptive: call on every VSync frame
++            this.animate(Math.min(elapsed, 100));
++          } else {
++            this._frameAccum += elapsed;
++            if (this._frameAccum >= interval) {
++              const dt = Math.min(this._frameAccum, 100);
++              this._frameAccum = 0;
++              this.animate(dt);
++            }
++          }
+         });
+       }
+ 
+       if (!this._animTimeline.is_playing()) {
+         this._lastFrameUs = 0;
++        this._frameAccum = 0;
+         this._animTimeline.start();
+       }
+     }
+diff --git a/extension.js b/extension.js
+index f6648d2..2385fbb 100644
+--- a/extension.js
++++ b/extension.js
+@@ -945,10 +945,12 @@ export default class Dash2DockLiteExt extends Extension {
+     this.docks.forEach((dock) => {
+       dock.cancelAnimations();
+     });
+-    this.animationInterval =
+-      ANIM_INTERVAL + (this.animation_fps || 0) * ANIM_INTERVAL_PAD;
++    // 0 = Adaptive (every VSync, no throttle)
++    // 1 = Normal (~60fps, 17ms)
++    // 2 = Economy (~30fps, 33ms)
++    this.animationInterval = this.animation_fps === 0 ? 0 : this.animation_fps * 17;
+     this._hiTimer.shutdown();
+-    this._hiTimer.initialize(this.animationInterval);
++    this._hiTimer.initialize(ANIM_INTERVAL); // keep hiTimer at 15ms for runOnce callbacks
+   }
+ 
+   _updateShrink(disable) {
+diff --git a/ui/tweaks.ui b/ui/tweaks.ui
+index c721239..9112273 100644
+--- a/ui/tweaks.ui
++++ b/ui/tweaks.ui
+@@ -229,7 +229,7 @@
+         <child>
+           <object class="AdwActionRow">
+             <property name="title" translatable="yes">Framerate</property>
+-            <property name="subtitle" translatable="yes">Set animation framerate. High setting shows smooth animations at the expense of high cpu resource.</property>
++            <property name="subtitle" translatable="yes">Adaptive syncs to your display refresh rate. Normal (60fps) or Economy (30fps) reduce GPU load on high-refresh monitors.</property>
+             <property name="activatable-widget">animation-fps</property>
+             <child>
+               <object class="GtkDropDown" id="animation-fps">
+@@ -334,12 +334,12 @@
+   </object>
+   <object class="GtkStringList" id="animation-fps-model">
+     <items>
+-      <item translatable="yes">High</item>
+-      <!-- 15 60ps-->
+-      <item translatable="yes">Medium</item>
+-      <!-- 25 40fps -->
+-      <item translatable="yes">Low</item>
+-      <!-- 50 20fps -->
++      <item translatable="yes">Adaptive</item>
++      <!-- every VSync frame, synced to display refresh rate -->
++      <item translatable="yes">Normal (60fps)</item>
++      <!-- 17ms interval -->
++      <item translatable="yes">Economy (30fps)</item>
++      <!-- 33ms interval -->
+     </items>
+   </object>
+   <object class="GtkStringList" id="multi-monitor-filter-model">
+-- 
+2.53.0
+

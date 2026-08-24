@@ -130,7 +130,37 @@ export default class Dash2DockLiteExt extends Extension {
     this.docks = [];
   }
 
-  recreateAllDocks(delay = 750) {
+  recreateAllDocks(delay) {
+    // Some callers bind this directly as a signal handler (e.g.
+    // notify::scale-factor), so `delay` may arrive as a GObject. Guard it.
+    if (typeof delay !== 'number') {
+      delay = 750;
+    }
+
+    // Defer the rebuild out of the current signal handler / paint cycle.
+    // On resume this is driven by notify::scale-factor / monitors-changed,
+    // which fire mid-frame; recreating actors synchronously there let mutter
+    // paint half-torn-down actors and crash in swap_buffers. Debounced so a
+    // burst of resume signals collapses into a single rebuild.
+    if (!this._loTimer) {
+      this._doRecreateAllDocks();
+      return;
+    }
+    if (this._recreateAllSeq) {
+      this._loTimer.runDebounced(this._recreateAllSeq);
+    } else {
+      this._recreateAllSeq = this._loTimer.runDebounced(
+        () => {
+          this._recreateAllSeq = null;
+          this._doRecreateAllDocks();
+        },
+        delay,
+        'recreateAllDocks'
+      );
+    }
+  }
+
+  _doRecreateAllDocks() {
     console.log('recreate all docks');
 
     // recreate only the dash
@@ -246,6 +276,7 @@ export default class Dash2DockLiteExt extends Extension {
     this._hiTimer?.shutdown();
     this._loTimer?.shutdown();
     this._diagnosticTimer?.shutdown();
+    this._recreateAllSeq = null;
     // null later
 
     this._removeEvents();

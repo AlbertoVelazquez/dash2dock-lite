@@ -153,6 +153,11 @@ export let Dock = GObject.registerClass(
         }
 
         this.remove_child(this.dash);
+        // Destroy explicitly: leaving the Dash orphaned (unparented + no JS
+        // reference) let the GC finalize it mid-frame, so mutter freed its
+        // children list during swap_buffers over an already-freed vtable
+        // (SIGSEGV on resume). destroy() tears it down safely via Clutter now.
+        this.dash.destroy();
         this.dash = null;
         this._trashIcon = null;
         this._recentFilesIcon = null;

@@ -45,14 +45,28 @@ export let Animator = class {
   }
 
   disable() {
+    // Destroy the custom-painted actors explicitly so they leave mutter's
+    // paint pipeline synchronously. Previously we only removed them from
+    // their parent and dropped the JS references, letting the GC finalize a
+    // DotCanvas/St.DrawingArea mid-frame -> g_object_unref on a freed vtable
+    // during cogl_onscreen_swap_buffers_with_damage (SIGSEGV on resume).
+    [this._renderers, this._dots, this._badges].forEach((list) => {
+      (list || []).forEach((actor) => {
+        if (actor && actor.destroy) {
+          actor.destroy();
+        }
+      });
+    });
+
     if (this._target) {
       this._target.remove_all_children();
     }
-    if (!this._renderers) {
-      this._renderers = [];
-      this._dots = [];
-      this._badges = [];
-    }
+
+    this._renderers = [];
+    this._dots = [];
+    this._badges = [];
+    this._target = null;
+    this._computed = null;
   }
 
   _precreateResources(dock) {

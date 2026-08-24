@@ -32,6 +32,9 @@ export let AutoHide = class {
     this._enabled = true;
     this._shown = true;
     this._dwell = 0;
+    if (!this._trackedWindows) {
+      this._trackedWindows = new Set();
+    }
     console.log('autohide enabled');
   }
 
@@ -45,13 +48,15 @@ export let AutoHide = class {
 
     this._enabled = false;
 
-    let actors = global.get_window_actors();
-    let windows = actors.map((a) => a.get_meta_window());
-    windows.forEach((w) => {
-      if (w._tracked) {
-        this._untrack(w);
-      }
-    });
+    // Disconnect from every window WE tracked, not just the ones still present
+    // in global.get_window_actors(). A window closed while the dock was torn
+    // down (e.g. on resume) would otherwise keep a handler bound to this
+    // now-dead AutoHide instance -> disconnect on a finalized object ->
+    // SIGSEGV in g_hash_table_remove.
+    if (this._trackedWindows) {
+      [...this._trackedWindows].forEach((w) => this._untrack(w));
+      this._trackedWindows.clear();
+    }
 
     console.log('autohide disabled');
   }
@@ -160,30 +165,31 @@ export let AutoHide = class {
   }
 
   _track(window) {
-    //! window tracking should be made global
-    if (!window._tracked) {
+    if (!window) return;
+    if (!this._trackedWindows) {
+      this._trackedWindows = new Set();
+    }
+    if (!this._trackedWindows.has(window)) {
       window.connectObject(
         'position-changed',
-        // this._debounceCheckHide.bind(this),
         () => {
           this.dock.extension.checkHide();
         },
         'size-changed',
-        // this._debounceCheckHide.bind(this),
         () => {
           this.dock.extension.checkHide();
         },
         this
       );
-      window._tracked = true;
+      this._trackedWindows.add(window);
     }
   }
 
   _untrack(window) {
     try {
-      if (window && window._tracked) {
+      if (window && this._trackedWindows && this._trackedWindows.has(window)) {
         window.disconnectObject(this);
-        window._tracked = false;
+        this._trackedWindows.delete(window);
       }
     } catch (err) {
       // may have been destroyed already
